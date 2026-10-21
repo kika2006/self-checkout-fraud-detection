@@ -1,0 +1,716 @@
+---
+title: "Fraud Detection – Supermarket Self-Checkout"
+subtitle: "EDA: Items & Basket Size"
+author: "Francisca (Kika) Freixo"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    theme: flatly
+    highlight: tango
+    code_folding: show
+    number_sections: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo    = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  fig.width  = 9,
+  fig.height = 5,
+  dpi     = 150
+)
+```
+
+```{r libraries}
+library(tidyverse)
+library(scales)
+library(patchwork)
+library(knitr)
+library(kableExtra)
+```
+
+---
+
+# Data Loading & Parsing
+
+The dataset is a bit unusual. There is no header, no customer ID column, and the data is not structured in a typical tabular way. Each row is one shopping trip, and within that row each scanned item is stored as a comma-separated string of the form `department_id time_gap price`. So a row might look like:
+
+```
+10 22 3.18, 10 173 6.56, 18 93 4.31, ...
+```
+
+Since rows have no labels, we assign `customer_id` as the row number (customer 1 = row 1, and so on). The number of items per row also varies, which is why a standard CSV reader chokes on this file — we need to read it as a single text column and parse it ourselves.
+
+```{r load-raw}
+raw <- read_delim(
+  "../data/supermarket.csv",
+  delim          = "|",      # pipe as a dummy delimiter so nothing gets split
+  col_names      = FALSE,
+  show_col_types = FALSE
+)
+
+cat("Customers loaded:", nrow(raw), "\n")
+cat("Preview of row 1:\n")
+cat(str_trunc(as.character(raw[[1]][1]), 130), "\n")
+```
+
+## Reshaping to long format
+
+Once loaded, we split each row on commas to get individual items, then parse the three space-separated values out of each token.
+
+```{r parse-long}
+long <- raw %>%
+  mutate(customer_id = row_number(), .before = 1) %>%
+  rename(raw_row = X1) %>%
+  mutate(items = str_split(raw_row, ",")) %>%
+  select(customer_id, items) %>%
+  unnest(items) %>%
+  mutate(items = str_squish(items)) %>%
+  filter(items != "", items != "NA") %>%
+  separate(
+    items,
+    into    = c("department_id", "time_gap", "price"),
+    sep     = "\\s+",
+    convert = TRUE,
+    extra   = "drop",
+    fill    = "right"
+  ) %>%
+  group_by(customer_id) %>%
+  mutate(scan_order = row_number()) %>%
+  ungroup() %>%
+  select(customer_id, scan_order, department_id, time_gap, price)
+
+cat("Total item scans:", nrow(long), "\n")
+cat("Customers:", n_distinct(long$customer_id), "\n")
+
+long %>%
+  slice_head(n = 8) %>%
+  kable(caption = "First 8 rows of the long-format dataset") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+```
+
+```{r check-parse-issues}
+issues <- long %>%
+  filter(is.na(price) | is.na(department_id) | is.na(time_gap))
+
+cat("Rows that failed to parse cleanly:", nrow(issues), "\n")
+```
+
+---
+
+# Feature Engineering
+
+Before any plots, we roll up the long item-level data into a single row per customer. The features chosen here are designed around what normal shopping should look like — then we can look for deviations.
+
+```{r customer-features}
+customers <- long %>%
+  group_by(customer_id) %>%
+  summarise(
+    n_items       = n(),
+    total_spend   = round(sum(price,             na.rm = TRUE), 2),
+    avg_price     = round(mean(price,            na.rm = TRUE), 2),
+    n_departments = n_distinct(department_id,    na.rm = TRUE),
+    total_time    = sum(time_gap,                na.rm = TRUE),
+    n_fast_scans  = sum(time_gap < 5,            na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    fast_scan_ratio = round(n_fast_scans / n_items,   3),
+    spend_per_item  = round(total_spend  / n_items,   2),
+    items_per_dept  = round(n_items      / n_departments, 2)
+  )
+
+# What fraction of the basket comes from the single most-visited department?
+dept_repeats <- long %>%
+  count(customer_id, department_id, name = "dept_scan_count") %>%
+  group_by(customer_id) %>%
+  summarise(max_dept_repeats = max(dept_scan_count), .groups = "drop")
+
+customers <- customers %>%
+  left_join(dept_repeats, by = "customer_id") %>%
+  mutate(top_dept_pct = round(max_dept_repeats / n_items, 3))
+
+cat("Customer-level dataset:", nrow(customers), "rows,", ncol(customers), "columns\n\n")
+
+customers %>%
+  summarise(across(
+    c(n_items, total_spend, avg_price, n_departments,
+      spend_per_item, items_per_dept, top_dept_pct),
+    list(min    = min,
+         median = median,
+         mean   = ~round(mean(.), 2),
+         max    = max,
+         sd     = ~round(sd(.), 2))
+  )) %>%
+  pivot_longer(everything(), names_to = "stat") %>%
+  separate(stat, into = c("variable", "metric"), sep = "_(?=[^_]+$)") %>%
+  pivot_wider(names_from = metric, values_from = value) %>%
+  kable(caption = "Summary statistics across all 100,000 customers") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"))
+```
+
+---
+
+# Basket Size Distribution {.tabset}
+
+The first question is simply: how many items do people actually buy? This gives us the baseline for everything else — once we know what a typical basket looks like, anything too far from it becomes worth investigating.
+
+## Setting Thresholds
+
+There are two ways to define "unusual" here. Statistically, we use the IQR method (anything beyond Q1 − 1.5×IQR or Q3 + 1.5×IQR). We also add a domain-specific lower cutoff of ≤5 items, since a basket that small at a self-checkout is genuinely rare and worth flagging regardless of the statistical distribution.
+
+```{r thresholds}
+q1 <- quantile(customers$n_items, 0.25)
+q3 <- quantile(customers$n_items, 0.75)
+iqr <- q3 - q1
+upper_fence   <- q3 + 1.5 * iqr
+lower_fence   <- q1 - 1.5 * iqr
+small_threshold <- 5
+
+cat(sprintf("Q1 = %g | Q3 = %g | IQR = %g\n", q1, q3, iqr))
+cat(sprintf("Upper fence: %g  |  Lower fence: %g (effectively 0)\n",
+            upper_fence, lower_fence))
+
+customers <- customers %>%
+  mutate(basket_flag = case_when(
+    n_items <= small_threshold ~ "Very small (≤5)",
+    n_items  > upper_fence    ~ "Very large (>43)",
+    TRUE                      ~ "Normal"
+  ))
+
+# Spend quadrants — split on medians, used later in section 6
+spend_med <- median(customers$total_spend)
+items_med <- median(customers$n_items)
+
+customers <- customers %>%
+  mutate(spend_quadrant = case_when(
+    n_items <= items_med & total_spend >  spend_med ~ "Few items, high spend",
+    n_items >  items_med & total_spend <= spend_med ~ "Many items, low spend",
+    n_items <= items_med & total_spend <= spend_med ~ "Few items, low spend",
+    TRUE                                            ~ "Many items, high spend"
+  ),
+  repeat_dept_flag = top_dept_pct > 0.50)
+
+customers %>%
+  count(basket_flag, name = "customers") %>%
+  mutate(share = percent(customers / sum(customers), 0.1)) %>%
+  kable(caption = "How many customers fall into each basket category") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+```
+
+## Histogram
+
+```{r hist-basket, fig.cap="Basket size distribution — the bulk of customers buy between 10 and 30 items"}
+flag_colours <- c(
+  "Very small (≤5)"  = "#e74c3c",
+  "Normal"           = "#3498db",
+  "Very large (>43)" = "#8e44ad"
+)
+
+ggplot(customers, aes(x = n_items, fill = basket_flag)) +
+  geom_histogram(binwidth = 2, colour = "white", alpha = 0.88) +
+  geom_vline(xintercept = small_threshold + 0.5,
+             linetype = "dashed", colour = "#c0392b", linewidth = 0.9) +
+  geom_vline(xintercept = upper_fence,
+             linetype = "dashed", colour = "#6c3483", linewidth = 0.9) +
+  annotate("text", x = small_threshold + 1.5, y = 5500,
+           label = paste0("≤", small_threshold, " items\n(very small)"),
+           hjust = 0, colour = "#c0392b", size = 3.2, fontface = "bold") +
+  annotate("text", x = upper_fence + 1.5, y = 5500,
+           label = ">43 items\n(IQR outlier)",
+           hjust = 0, colour = "#6c3483", size = 3.2, fontface = "bold") +
+  scale_fill_manual(values = flag_colours) +
+  scale_x_continuous(breaks = seq(0, 110, 10)) +
+  scale_y_continuous(labels = comma) +
+  labs(
+    title    = "How Many Items Do Customers Scan?",
+    subtitle = "n = 100,000 customers | Median = 19 items | Range = 3 to 108",
+    x        = "Number of items scanned",
+    y        = "Number of customers",
+    fill     = NULL
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "bottom",
+        plot.subtitle = element_text(colour = "grey40", size = 10))
+```
+
+The distribution is roughly bell-shaped but with a noticeable right skew — most people buy somewhere between 10 and 30 items, but there is a long tail of larger shops. The left end is more interesting from a fraud perspective: 1,887 customers scanned 5 or fewer items. That could easily be someone grabbing a coffee and a sandwich, but it could also be someone who scanned a single cheap item while pocketing the rest.
+
+## Box Plot
+
+```{r boxplot-basket, fig.cap="Spread within each category — note how wide the 'very large' group is"}
+ggplot(customers, aes(x = basket_flag, y = n_items, fill = basket_flag)) +
+  geom_boxplot(alpha = 0.75, outlier.colour = "grey40",
+               outlier.alpha = 0.3, outlier.size = 0.8) +
+  scale_fill_manual(values = flag_colours) +
+  scale_y_continuous(breaks = seq(0, 110, 10)) +
+  labs(
+    title = "Basket Size by Category",
+    x     = NULL,
+    y     = "Number of items"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "none")
+```
+
+---
+
+# Department Spread {.tabset}
+
+Basket size alone doesn't tell the whole story. A customer buying 30 items from a single department is very different from one buying 30 items spread across 12 departments — even though the basket size is identical. The store has 18 departments, and we'd expect a typical shopping trip to touch several of them.
+
+## Items vs Departments
+
+```{r scatter-dept, fig.cap="The linear trend shows that more items normally means more departments visited"}
+ggplot(customers, aes(x = n_items, y = n_departments, colour = basket_flag)) +
+  geom_point(alpha = 0.20, size = 0.8) +
+  geom_smooth(
+    data     = filter(customers, basket_flag == "Normal"),
+    method   = "lm", se = TRUE, colour = "black",
+    linewidth = 0.8, linetype = "solid"
+  ) +
+  scale_colour_manual(values = flag_colours) +
+  scale_x_continuous(breaks = seq(0, 110, 10)) +
+  scale_y_continuous(breaks = 1:18) +
+  labs(
+    title    = "Basket Size vs. Departments Visited",
+    subtitle = "Points well below the trend line → large basket from very few areas of the store",
+    x        = "Number of items scanned",
+    y        = "Distinct departments visited",
+    colour   = NULL
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "bottom",
+        plot.subtitle = element_text(colour = "grey40", size = 10))
+```
+
+There is a clear positive relationship — the more items in a basket, the more departments visited. Customers sitting far below the trend line are the ones to watch: they have basket sizes that suggest a real shop but department coverage that suggests they barely moved around the store.
+
+## Concentration Ratio
+
+```{r hist-conc, fig.cap="Items per department — most people average 2 items per department"}
+ggplot(customers, aes(x = items_per_dept, fill = basket_flag)) +
+  geom_histogram(binwidth = 0.5, colour = "white", alpha = 0.85) +
+  scale_fill_manual(values = flag_colours) +
+  scale_y_continuous(labels = comma) +
+  labs(
+    title    = "Items per Department (Concentration Ratio)",
+    subtitle = "A normal shop sits around 2. Values above 4–5 suggest the customer barely left one area.",
+    x        = "Average items per department visited",
+    y        = "Number of customers",
+    fill     = NULL
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "bottom",
+        plot.subtitle = element_text(colour = "grey40", size = 10))
+```
+
+## Which Departments Are Most Common?
+
+It's also worth understanding which departments dominate baskets across the whole dataset — both to understand normal shopping patterns and to check whether suspicious baskets are systematically concentrated in particular areas.
+
+```{r dept-frequency, fig.height=5, fig.cap="Department 15 appears in far more baskets than any other — worth flagging if over-represented in anomalous trips"}
+long %>%
+  count(department_id, name = "total_scans") %>%
+  mutate(department_id = factor(department_id)) %>%
+  ggplot(aes(x = reorder(department_id, total_scans), y = total_scans, fill = total_scans)) +
+  geom_col(show.legend = FALSE, alpha = 0.85) +
+  geom_text(aes(label = comma(total_scans)), hjust = -0.1, size = 3) +
+  coord_flip() +
+  scale_fill_gradient(low = "#aed6f1", high = "#1a5276") +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.15)), labels = comma) +
+  labs(
+    title = "Total Item Scans per Department",
+    subtitle = "Across all 100,000 customers",
+    x = "Department ID",
+    y = "Total scans"
+  ) +
+  theme_minimal(base_size = 12)
+```
+
+```{r dept-by-flag, fig.height=5, fig.cap="Comparing department usage between normal and suspicious baskets"}
+long %>%
+  left_join(select(customers, customer_id, basket_flag), by = "customer_id") %>%
+  count(basket_flag, department_id) %>%
+  group_by(basket_flag) %>%
+  mutate(share = n / sum(n)) %>%
+  ungroup() %>%
+  mutate(department_id = factor(department_id)) %>%
+  ggplot(aes(x = reorder(department_id, share), y = share, fill = basket_flag)) +
+  geom_col(position = "dodge", alpha = 0.85) +
+  scale_fill_manual(values = flag_colours) +
+  scale_y_continuous(labels = percent) +
+  coord_flip() +
+  labs(
+    title    = "Department Share by Basket Type",
+    subtitle = "Are suspicious baskets concentrated in different departments from normal ones?",
+    x        = "Department ID",
+    y        = "Share of scans (within basket category)",
+    fill     = NULL
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "bottom",
+        plot.subtitle = element_text(colour = "grey40", size = 10))
+```
+
+---
+
+# Repeat Department Scanning {.tabset}
+
+Another angle: even within the departments a customer visits, are they scanning the same one over and over? `top_dept_pct` captures what fraction of the basket comes from the customer's single most-visited department. If that number is very high, the customer is not really moving around — they're hammering the same section repeatedly.
+
+## Distribution
+
+```{r hist-repeat, fig.cap="Most customers get roughly 25% of their basket from their most-visited department"}
+ggplot(customers, aes(x = top_dept_pct, fill = repeat_dept_flag)) +
+  geom_histogram(binwidth = 0.025, colour = "white", alpha = 0.85) +
+  geom_vline(xintercept = 0.50, linetype = "dashed",
+             colour = "#c0392b", linewidth = 0.9) +
+  annotate("text", x = 0.52, y = 7500,
+           label = "50% threshold",
+           colour = "#c0392b", hjust = 0, size = 3.5, fontface = "bold") +
+  scale_fill_manual(
+    values = c("FALSE" = "#3498db", "TRUE" = "#e74c3c"),
+    labels = c("FALSE" = "Not flagged", "TRUE" = "Flagged (>50%)")
+  ) +
+  scale_x_continuous(labels = percent) +
+  scale_y_continuous(labels = comma) +
+  labs(
+    title    = "How Concentrated Is Each Customer's Basket?",
+    subtitle = "Top dept share > 50% = more than half the basket from a single department",
+    x        = "Share of basket from most-scanned department",
+    y        = "Number of customers",
+    fill     = NULL
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "bottom",
+        plot.subtitle = element_text(colour = "grey40", size = 10))
+```
+
+The bulk of customers have their top department representing around 20–35% of their basket, which is normal. The right tail — people where one department accounts for more than half their shop — is worth looking at more closely, especially when this overlaps with other signals.
+
+## Flagged vs Normal
+
+```{r repeat-summary}
+customers %>%
+  group_by(repeat_dept_flag) %>%
+  summarise(
+    n_customers    = n(),
+    median_items   = median(n_items),
+    median_depts   = median(n_departments),
+    median_top_pct = percent(median(top_dept_pct), 0.1),
+    median_spend   = dollar(median(total_spend), prefix = "€")
+  ) %>%
+  mutate(repeat_dept_flag = ifelse(repeat_dept_flag, "Flagged (>50%)", "Normal")) %>%
+  rename(`Repeat flag` = repeat_dept_flag) %>%
+  kable(caption = "Flagged vs normal customers on the repeat-department metric") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+```
+
+---
+
+# Basket Size vs. Total Spend {.tabset}
+
+This is probably the most useful fraud signal in the basket dimension. If you scan more items, you should spend more money — that relationship should be strong and fairly consistent. Customers who break that pattern in either direction are unusual.
+
+The two suspicious patterns are:
+- **Few items, high spend** — possible barcode substitution (an expensive item scanned under a cheap product's code)
+- **Many items, low spend** — possible under-scanning (items placed in the bag without being scanned, while a cheap item gets scanned repeatedly instead)
+
+## Scatter Plot
+
+```{r scatter-spend, fig.cap="The spend-items relationship is clear for normal customers; the red and orange groups deviate from it"}
+quad_colours <- c(
+  "Few items, high spend"  = "#e74c3c",
+  "Many items, low spend"  = "#e67e22",
+  "Few items, low spend"   = "#bdc3c7",
+  "Many items, high spend" = "#27ae60"
+)
+
+# Correlation for annotation
+r <- cor(customers$n_items, customers$total_spend) %>% round(3)
+
+ggplot(customers, aes(x = n_items, y = total_spend, colour = spend_quadrant)) +
+  geom_point(alpha = 0.18, size = 0.8) +
+  geom_vline(xintercept = items_med, linetype = "dotted", colour = "grey40") +
+  geom_hline(yintercept = spend_med, linetype = "dotted", colour = "grey40") +
+  geom_smooth(
+    data      = filter(customers, basket_flag == "Normal"),
+    method    = "lm", se = FALSE, colour = "black",
+    linewidth  = 0.9, linetype = "dashed"
+  ) +
+  annotate("text", x = 2, y = max(customers$total_spend) * 0.95,
+           label = "⚠ Few items\nhigh spend",
+           colour = "#c0392b", hjust = 0, size = 3.5, fontface = "bold") +
+  annotate("text", x = items_med + 1, y = 3,
+           label = "⚠ Many items\nlow spend",
+           colour = "#d35400", hjust = 0, size = 3.5, fontface = "bold") +
+  annotate("text", x = 80, y = max(customers$total_spend) * 0.95,
+           label = paste0("r = ", r),
+           colour = "grey30", hjust = 0, size = 3.5) +
+  scale_colour_manual(values = quad_colours) +
+  scale_x_continuous(breaks = seq(0, 110, 10)) +
+  scale_y_continuous(labels = dollar_format(prefix = "€")) +
+  labs(
+    title    = "Basket Size vs. Total Spend",
+    subtitle = paste0("Medians: ", items_med, " items | €", round(spend_med, 0),
+                      " spend — dotted lines mark the split"),
+    x        = "Number of items scanned",
+    y        = "Total spend (€)",
+    colour   = NULL
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "bottom",
+        plot.subtitle = element_text(colour = "grey40", size = 10))
+```
+
+The correlation is strong (r = `r r`), which tells us the linear relationship is real — scanning more items generally does mean spending more. What makes the outliers stand out is precisely how clearly they break from that pattern. A customer in the red quadrant with 3 items and a €120 spend is not making a normal purchase.
+
+## Quadrant Breakdown
+
+```{r quadrant-table}
+customers %>%
+  count(spend_quadrant, name = "n_customers") %>%
+  mutate(
+    share     = percent(n_customers / sum(n_customers), 0.1),
+    flag      = case_when(
+      spend_quadrant == "Few items, high spend"  ~ "Suspicious",
+      spend_quadrant == "Many items, low spend"  ~ "Suspicious",
+      TRUE                                       ~ "Normal"
+    )
+  ) %>%
+  arrange(desc(n_customers)) %>%
+  kable(caption = "Customers per spend quadrant") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+```
+
+## Spend per Item
+
+```{r hist-spi, fig.cap="Average spend per item — most customers average €2–4 per item"}
+ggplot(customers, aes(x = spend_per_item, fill = basket_flag)) +
+  geom_histogram(binwidth = 0.15, colour = "white", alpha = 0.85) +
+  scale_fill_manual(values = flag_colours) +
+  scale_x_continuous(labels = dollar_format(prefix = "€")) +
+  scale_y_continuous(labels = comma) +
+  labs(
+    title    = "Average Spend per Item",
+    subtitle = "Very high values in small baskets are the most suspicious combination",
+    x        = "Spend per item (€)",
+    y        = "Number of customers",
+    fill     = NULL
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "bottom",
+        plot.subtitle = element_text(colour = "grey40", size = 10))
+```
+
+---
+
+# Scan Position Analysis {.tabset}
+
+This is something that isn't obvious from the other dimensions but matters quite a bit in self-checkout fraud: *where in the scanning sequence does unusual behaviour occur?*
+
+Items scanned very early might be legitimately the first things placed on the belt. Items scanned at the very end — particularly cheap ones in an otherwise expensive basket — could suggest a customer who scanned one or two real items, then added cheaper dummy scans to make the total seem plausible.
+
+## Price Across Scan Position
+
+```{r scan-position-price, fig.cap="Does the price of items change depending on when they are scanned?"}
+long %>%
+  filter(scan_order <= 40) %>%   # cap at 40 to keep the plot readable
+  group_by(scan_order) %>%
+  summarise(
+    mean_price   = mean(price,   na.rm = TRUE),
+    median_price = median(price, na.rm = TRUE),
+    n            = n(),
+    .groups = "drop"
+  ) %>%
+  ggplot(aes(x = scan_order)) +
+  geom_ribbon(aes(ymin = median_price, ymax = mean_price), alpha = 0.15, fill = "#3498db") +
+  geom_line(aes(y = mean_price,   colour = "Mean"),   linewidth = 0.9) +
+  geom_line(aes(y = median_price, colour = "Median"), linewidth = 0.9, linetype = "dashed") +
+  scale_colour_manual(values = c("Mean" = "#2980b9", "Median" = "#e74c3c")) +
+  scale_y_continuous(labels = dollar_format(prefix = "€")) +
+  labs(
+    title    = "Item Price by Scan Position",
+    subtitle = "Positions 1–40 shown | Does the last item scanned tend to be cheaper than the rest?",
+    x        = "Scan position (order within the trip)",
+    y        = "Price (€)",
+    colour   = NULL
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "bottom",
+        plot.subtitle = element_text(colour = "grey40", size = 10))
+```
+
+## First vs Last Item Price
+
+A specific hypothesis: customers committing substitution fraud might scan a real expensive item first (to appear legitimate) and then scan a cheap decoy as the last item. Let's check whether the first and last items in a basket systematically differ in price.
+
+```{r first-last-price}
+first_last <- long %>%
+  group_by(customer_id) %>%
+  summarise(
+    first_price  = first(price),
+    last_price   = last(price),
+    basket_size  = n(),
+    .groups = "drop"
+  ) %>%
+  mutate(price_drop = first_price - last_price)
+
+# Summary
+first_last %>%
+  summarise(
+    median_first = median(first_price),
+    median_last  = median(last_price),
+    median_drop  = median(price_drop),
+    pct_cheaper_at_end = mean(last_price < first_price)
+  ) %>%
+  mutate(across(where(is.numeric), ~round(., 3))) %>%
+  kable(caption = "First item vs last item — price comparison") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+
+# Distribution of price drop
+ggplot(first_last, aes(x = price_drop)) +
+  geom_histogram(binwidth = 0.5, fill = "#3498db", colour = "white", alpha = 0.85) +
+  geom_vline(xintercept = 0, linetype = "dashed", colour = "#e74c3c", linewidth = 0.9) +
+  scale_x_continuous(labels = dollar_format(prefix = "€")) +
+  scale_y_continuous(labels = comma) +
+  labs(
+    title    = "Price of First Item Minus Price of Last Item",
+    subtitle = "Positive values = last item was cheaper than the first\nLarge positive values may indicate a cheap item scanned at the end",
+    x        = "Price drop from first to last item (€)",
+    y        = "Number of customers"
+  ) +
+  theme_minimal(base_size = 12)
+```
+
+---
+
+# Combined Anomaly Signals {.tabset}
+
+Each of the previous sections produces one or more binary flags. Pulling them together gives us a simple composite risk score — customers who trigger multiple flags across different dimensions are much more likely to be genuinely suspicious than those who trigger just one.
+
+## Flag Engineering
+
+```{r anomaly-flags}
+anomaly <- customers %>%
+  mutate(
+    flag_very_small_basket   = basket_flag == "Very small (≤5)",
+    flag_very_large_basket   = basket_flag == "Very large (>43)",
+    flag_few_departments     = n_departments <= 3 & n_items >= items_med,
+    flag_repeat_dept         = repeat_dept_flag,
+    flag_few_items_hi_spend  = spend_quadrant == "Few items, high spend",
+    flag_many_items_lo_spend = spend_quadrant == "Many items, low spend",
+    n_flags = flag_very_small_basket + flag_very_large_basket +
+              flag_few_departments   + flag_repeat_dept +
+              flag_few_items_hi_spend + flag_many_items_lo_spend
+  )
+
+anomaly %>%
+  count(n_flags, name = "n_customers") %>%
+  mutate(share = percent(n_customers / sum(n_customers), 0.1)) %>%
+  kable(caption = "How many flags does each customer trigger?") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+```
+
+## Flag Frequency
+
+```{r flag-bar, fig.height=4}
+flag_labels <- c(
+  flag_very_small_basket   = "Very small basket (≤5 items)",
+  flag_very_large_basket   = "Very large basket (>43 items)",
+  flag_few_departments     = "Large basket, few departments (≤3)",
+  flag_repeat_dept         = "Single dept >50% of basket",
+  flag_few_items_hi_spend  = "Few items, high spend",
+  flag_many_items_lo_spend = "Many items, low spend"
+)
+
+anomaly %>%
+  select(starts_with("flag_"), -n_flags) %>%
+  summarise(across(everything(), sum)) %>%
+  pivot_longer(everything(), names_to = "flag", values_to = "n") %>%
+  mutate(
+    label = flag_labels[flag],
+    share = n / nrow(anomaly)
+  ) %>%
+  ggplot(aes(x = reorder(label, n), y = n, fill = n)) +
+  geom_col(show.legend = FALSE, alpha = 0.85) +
+  geom_text(aes(label = paste0(comma(n), "  (", percent(share, 0.1), ")")),
+            hjust = -0.05, size = 3) +
+  coord_flip() +
+  scale_fill_gradient(low = "#f39c12", high = "#c0392b") +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.4)), labels = comma) +
+  labs(
+    title = "How Often Is Each Flag Triggered?",
+    x     = NULL,
+    y     = "Customers flagged"
+  ) +
+  theme_minimal(base_size = 12)
+```
+
+## Top Suspicious Customers
+
+```{r top-suspicious}
+anomaly %>%
+  filter(n_flags >= 2) %>%
+  select(customer_id, n_items, total_spend, spend_per_item,
+         n_departments, top_dept_pct, basket_flag, spend_quadrant, n_flags) %>%
+  arrange(desc(n_flags), desc(spend_per_item)) %>%
+  slice_head(n = 20) %>%
+  kable(caption = paste0(
+    "Top 20 highest-risk customers — ",
+    comma(sum(anomaly$n_flags >= 2)), " customers total with ≥2 flags"
+  )) %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"),
+                font_size = 11) %>%
+  scroll_box(width = "100%", height = "400px")
+```
+
+```{r export}
+dir.create("output", showWarnings = FALSE)
+write_csv(anomaly, "output/basket_anomaly_signals.csv")
+cat("Exported", nrow(anomaly), "customers to output/basket_anomaly_signals.csv\n")
+cat("Customers with ≥2 flags:", comma(sum(anomaly$n_flags >= 2)), "\n")
+```
+
+---
+
+# Summary
+
+## What Normal Looks Like
+
+After looking at 100,000 trips and just over 2 million scanned items, a fairly consistent picture of a normal self-checkout customer emerges:
+
+| Metric | Typical range |
+|---|---|
+| Items per trip | 13–25 |
+| Departments visited | 7–11 |
+| Total spend | €32–€75 |
+| Spend per item | €1.92–€3.72 |
+| Top department share | ~25% of basket |
+
+The spend-to-items relationship is notably consistent (r = `r r`), which means deviations from it are meaningful and not just noise.
+
+## What Looks Suspicious
+
+The signals that stand out most — and which should feed directly into the clustering step:
+
+**`n_items` and `basket_flag`** — Very small baskets (≤5 items) and very large ones (>43) are both unusual, but for different reasons. Small baskets are suspicious when they involve high spend or few departments. Large baskets are suspicious when spend is disproportionately low.
+
+**`items_per_dept` and `n_departments`** — A customer with a large basket but very low department count is not moving around the store normally. This is one of the cleaner signals because it's hard to explain innocently at high extremes.
+
+**`top_dept_pct`** — More than half the basket from a single department is unusual. Combined with a small basket size, it's a strong indicator of repeat-scanning the same item.
+
+**Spend quadrants** — The "few items, high spend" group is the most direct signal for price manipulation. "Many items, low spend" is harder to act on alone but becomes much more suspicious in combination with other flags.
+
+**Scan position** — The first-vs-last item price analysis adds something the other dimensions don't: a *temporal* signal. If the last item in a trip is systematically cheaper than the rest, that pattern is worth tracking alongside the spatial signals.
+
+
+
+---
+
+*EDA: Items & Basket Size*
