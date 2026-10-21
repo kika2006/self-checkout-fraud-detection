@@ -1,6 +1,6 @@
 # Catching What Self-Checkout Misses: Fraud Detection for a Supermarket Chain
 
-**Author:** Francisca (Kika) Freixo  
+**Author:** Francisca Freixo  
 
 An unsupervised anomaly-detection system that ranks self-checkout shopping sessions by how likely they are to contain theft, so staff can spot-check the right customers instead of picking at random.
 

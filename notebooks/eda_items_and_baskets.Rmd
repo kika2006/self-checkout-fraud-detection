@@ -1,7 +1,7 @@
 ---
 title: "Fraud Detection – Supermarket Self-Checkout"
 subtitle: "EDA: Items & Basket Size"
-author: "Francisca (Kika) Freixo"
+author: "Francisca Freixo"
 date: "`r Sys.Date()`"
 output:
   html_document:
